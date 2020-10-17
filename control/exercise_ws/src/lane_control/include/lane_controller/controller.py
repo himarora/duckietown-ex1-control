@@ -1,6 +1,3 @@
-import numpy as np
-
-
 class PurePursuitLaneController:
     """
     The Lane Controller can be used to compute control commands from pose estimations.
@@ -11,7 +8,6 @@ class PurePursuitLaneController:
     """
 
     def __init__(self, parameters):
-
         self.parameters = parameters
 
     def update_parameters(self, parameters):
@@ -21,5 +17,3 @@ class PurePursuitLaneController:
                 parameters (:obj:`dict`): dictionary containing the new parameters for LaneController object.
         """
         self.parameters = parameters
-
-
