@@ -45,8 +45,8 @@ class LaneControllerNode(DTROS):
                                                  self.cbLanePoses,
                                                  queue_size=1)
         self.load_params()
-        # topic = "/agent/lane_filter_node/seglist_filtered"
-        topic = "/agent/ground_projection_node/lineseglist_out"
+        topic = "/agent/lane_filter_node/seglist_filtered"
+        # topic = "/agent/ground_projection_node/lineseglist_out"
         self.sub0 = rospy.Subscriber(topic,
                                      SegmentList,
                                      self.cbSegmentsGround,
@@ -54,13 +54,14 @@ class LaneControllerNode(DTROS):
         self.pose_msg = None
         self.mode = "straight"
         self.r_y = 0
-        self.tj = [0, 0]
+        self.state = (np.array([0, 0]) * 5)
+        self.tj = np.array([0] * 2)
         self.log("Node Initialized!")
 
     @staticmethod
     def filter_segments_array(segments_array, distance_threshold):
         # adjust color
-        segments_array[:, 0][segments_array[:, 0] == 2.] = 0.
+        segments_array[:, 0][segments_array[:, 0] == 2.] = 1.
 
         # filter length
         segments_array = segments_array[segments_array[:, -1] <= distance_threshold]
@@ -93,6 +94,49 @@ class LaneControllerNode(DTROS):
         f_pt = np.array((x2, y2))
         return w_eq, f_pt
 
+    @staticmethod
+    def get_trajectory(yl, wl, off):
+        yellow_line_detected = True if yl is not None else False
+        white_line_detected = True if wl is not None else False
+        wl = np.array((yl[0], yl[1] - 2 * off)) if not white_line_detected else wl
+        yl = np.array((wl[0], wl[1] + 2 * off)) if not yellow_line_detected else yl
+        return (yl + wl) / 2.
+
+    @staticmethod
+    def handle_noise_straight(yl, y_segs, wl, w_segs, off):
+        yellow_line_detected = True if yl is not None else False
+        white_line_detected = True if wl is not None else False
+
+        if white_line_detected:
+            # While going straight, if white line is detected on the left side and yellow line is not detected,
+            # shift the yellow line two units, and white line 4 units away
+            if w_segs[:, -2].mean() > 0:
+                yl = np.array((wl[0], wl[1] - 2 * off)) if not yellow_line_detected else yl
+                wl = None
+
+            # If both lines are detected but yellow line is detected on the right side of white line, assume that
+            # it is grass and compute trajectory using white line
+            elif yellow_line_detected and y_segs[:, -2].mean() < w_segs[:, -2].mean():
+                yl = None
+        return yl, wl
+
+    @staticmethod
+    def get_lookahead_point(tj_eq, l, y_f, n_y, w_f, n_w):
+        r_x = r_x1, r_x2 = np.roots(
+            [2 * tj_eq[0] ** 2, 2 * tj_eq[0] * tj_eq[1], tj_eq[1] ** 2 - l ** 2])
+        r_y1, r_y2 = tj_eq[0] * r_x + tj_eq[1]
+        r1, r2 = np.array([r_x1, r_y1]), np.array([r_x2, r_y2])
+        r = None
+        if y_f is not None and w_f is not None:
+            dir_pt = y_f if n_y > n_w else w_f
+        elif y_f is not None and w_f is None:
+            dir_pt = y_f
+        elif w_f is not None and y_f is None:
+            dir_pt = w_f
+        if not r:
+            r = r1 if norm(dir_pt - r1) < norm(dir_pt - r2) else r2
+        return r
+
     def load_params(self):
         def _init_dtparam(name):
             str_topics = []
@@ -105,7 +149,8 @@ class LaneControllerNode(DTROS):
             )
 
         param_names = ["L", "th_seg_dist", "th_seg_count", "off_lane", "th_seg_close", "th_seg_far", "wt_slope",
-                       "wt_dist", "th_turn_slope", "th_st_slope", "th_lane_slope", "pow_slope", "pow_dist", "v"]
+                       "wt_dist", "th_turn_slope", "th_st_slope", "th_lane_slope", "pow_slope", "pow_dist", "v",
+                       "wt_omega", "th_omega", "min_slope", "max_L", "exp"]
         self.p = {k: _init_dtparam(k) for k in param_names}
 
     def cbSegmentsGround(self, line_segments_msg):
@@ -113,50 +158,37 @@ class LaneControllerNode(DTROS):
         self.load_params()
 
         data = self.parse_segment_list(line_segments_msg, self.p["th_seg_dist"].value)  # was 0.3
-        white_segments = data[data[:, 0] == 0.]
-        n_white_segs = len(white_segments)
-        yellow_segments = data[data[:, 0] == 1.]
-        n_yellow_segs = len(yellow_segments)
+        white_segments, yellow_segments = data[data[:, 0] == 0.], data[data[:, 0] == 1.]
+        n_white_segs, n_yellow_segs = len(white_segments), len(yellow_segments)
         line_detection_threshold = self.p["th_seg_count"].value
-        white_detected = n_white_segs > line_detection_threshold
-        yellow_detected = n_yellow_segs > line_detection_threshold
+        white_detected, yellow_detected = n_white_segs > line_detection_threshold, n_yellow_segs > line_detection_threshold
 
+        # If none of the lines are detected, assume that the trajectory has not changed
         if not white_detected and not yellow_detected:
-            self.r_y = 0
-            return
+            w_eq, y_eq, tj_eq, w_f, y_f = self.state
 
-        w_eq, w_f = LaneControllerNode.get_equation(white_segments, self.p["th_seg_close"].value,
-                                                    self.p["th_seg_far"].value) if white_detected else (None, None)
-        y_eq, y_f = LaneControllerNode.get_equation(yellow_segments, self.p["th_seg_close"].value,
-                                                    self.p["th_seg_far"].value) if yellow_detected else (None, None)
-        w_eq = np.array(
-            (y_eq[0], -y_eq[1] + self.p["off_lane"].value)) if yellow_detected and not white_detected else w_eq
-        y_eq = np.array(
-            (w_eq[0], -w_eq[1] + self.p["off_lane"].value)) if white_detected and not yellow_detected else y_eq
-        tj_eq = (w_eq + y_eq) / 2.
+        # If any of the lines is detected, compute the new trajectory
+        else:
+            w_eq, w_f = LaneControllerNode.get_equation(white_segments, self.p["th_seg_close"].value,
+                                                        self.p["th_seg_far"].value) if white_detected else (None, None)
+            y_eq, y_f = LaneControllerNode.get_equation(yellow_segments, self.p["th_seg_close"].value,
+                                                        self.p["th_seg_far"].value) if yellow_detected else (None, None)
 
-        if np.abs(tj_eq[0]) <= self.p[
-            "th_lane_slope"].value and white_detected and not yellow_detected and white_segments[:, -2].mean() > 0:
-            y_eq = np.array((w_eq[0], w_eq[1] + self.p["off_lane"].value))
-        if white_detected and yellow_detected:
-            # straight
-            if np.abs(tj_eq[0]) <= self.p["th_lane_slope"].value and yellow_segments[:, -2].mean() < white_segments[:,
-                                                                                                     -2].mean():
-                y_eq = np.array((w_eq[0], -w_eq[1] + self.p["off_lane"].value))
-            elif tj_eq[0] < 0:
-                w_eq = np.array((y_eq[0], -y_eq[1] + self.p["off_lane"].value))
-        tj_eq = (w_eq + y_eq) / 2.
+            tj_slope = ((w_eq[0] if w_eq is not None else y_eq[0]) + (y_eq[0] if y_eq is not None else w_eq[0])) / 2.
 
-        if np.abs(tj_eq[0]) <= self.p["th_st_slope"].value:
-            self.r_y = 0
-            return
+            # Handle any noise
+            if np.abs(tj_slope) <= self.p["th_lane_slope"].value:
+                y_eq, w_eq = self.handle_noise_straight(y_eq, yellow_segments, w_eq, white_segments,
+                                                        self.p["off_lane"].value)
 
-        r_x = r_x1, r_x2 = np.roots(
-            [2 * tj_eq[0] ** 2, 2 * tj_eq[0] * tj_eq[1], tj_eq[1] ** 2 - self.p["L"].value ** 2])
-        r_y1, r_y2 = tj_eq[0] * r_x + tj_eq[1]
-        r1, r2 = np.array([r_x1, r_y1]), np.array([r_x2, r_y2])
-        dir_pt = y_f if n_yellow_segs > n_white_segs else w_f
-        r = r1 if norm(dir_pt - r1) < norm(dir_pt - r2) else r2
+            # While turning right, only use the yellow line
+            elif tj_slope < 0 and np.abs(tj_slope) > self.p["th_lane_slope"].value and yellow_detected:
+                w_eq = None
+
+            tj_eq = self.get_trajectory(y_eq, w_eq, self.p["off_lane"].value)
+
+        r = self.get_lookahead_point(tj_eq, self.p["L"].value, y_f, n_yellow_segs, w_f, n_white_segs)
+        self.state = (w_eq, y_eq, tj_eq, w_f, y_f)
         self.tj = tj_eq
         self.r_y = r[1]
 
@@ -167,19 +199,36 @@ class LaneControllerNode(DTROS):
             input_pose_msg (:obj:`LanePose`): Message containing information about the current lane pose.
         """
         self.pose_msg = input_pose_msg
+        # print()
         self.load_params()
         car_control_msg = Twist2DStamped()
         car_control_msg.header = self.pose_msg.header
 
-        car_control_msg.v = self.p["v"].value
-
-        omega = (2 * car_control_msg.v * self.r_y) / self.p["L"].value ** 2  # Pure Pursuit
+        v = self.p["v"].value
+        L = self.p["L"].value
+        slope = np.abs(self.tj[0]) + 1
+        # L *= (1 / np.exp(self.p["exp"].value * slope))
+        if slope >= self.p["th_turn_slope"].value:
+            L_factor = 1 / (slope * self.p["wt_slope"].value)
+            L *= L_factor
+        # L = min(L, self.p["max_L"].value)
+        # print(L)
+        omega = (2 * v * self.r_y) / L ** 2  # Pure Pursuit
 
         # Adjustments for turning
-        omega *= np.abs(self.p["wt_slope"].value * self.tj[0] ** self.p["pow_slope"].value * self.p["wt_dist"].value * (
-                self.tj[1] / self.tj[0]) ** self.p["pow_dist"].value) if np.abs(self.tj[0]) >= self.p[
-            "th_turn_slope"].value else 1.
+        # if np.abs(self.tj[0]) >= self.p[
+        #     "th_turn_slope"].value:
+        #     omega *= np.abs(
+        #         self.p["wt_slope"].value * self.tj[0] ** self.p["pow_slope"].value * self.p["wt_dist"].value * (
+        #                 self.tj[1] / self.tj[0]) ** self.p["pow_dist"].value)
+        # else:
+        #     omega *= 1
 
+        # if np.abs(omega) > self.p["th_omega"].value:
+        #     v *= np.abs(omega) * self.p["wt_omega"].value
+
+        # v *= 1 / ((np.abs(omega) + 1) * self.p["wt_omega"].value)
+        car_control_msg.v = v
         car_control_msg.omega = omega
         # self.log(car_control_msg.omega)
         self.publishCmd(car_control_msg)
