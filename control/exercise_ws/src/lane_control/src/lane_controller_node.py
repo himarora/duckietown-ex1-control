@@ -6,7 +6,7 @@ from duckietown_msgs.msg import Twist2DStamped, LanePose, SegmentList
 from numpy.linalg import norm
 
 from lane_controller.controller import PurePursuitLaneController
-
+np.set_printoptions(precision=2, suppress=True)
 
 class LaneControllerNode(DTROS):
     """Computes control action.
@@ -54,9 +54,10 @@ class LaneControllerNode(DTROS):
         self.pose_msg = None
         self.mode = "straight"
         self.r_y = 0
-        self.state = (np.array([0, 0]) * 5)
+        self.state = [np.array([0, 0])] * 5
         self.tj = np.array([0] * 2)
         self.log("Node Initialized!")
+        self.log(f"Subscribed to {topic}")
 
     @staticmethod
     def filter_segments_array(segments_array, distance_threshold):
@@ -98,27 +99,44 @@ class LaneControllerNode(DTROS):
     def get_trajectory(yl, wl, off):
         yellow_line_detected = True if yl is not None else False
         white_line_detected = True if wl is not None else False
-        wl = np.array((yl[0], yl[1] - 2 * off)) if not white_line_detected else wl
-        yl = np.array((wl[0], wl[1] + 2 * off)) if not yellow_line_detected else yl
+        if yellow_line_detected or white_line_detected:
+            if not white_line_detected:
+                wl = np.array((yl[0] if wl is None else wl[0], yl[1] - 2 * off))
+            elif not yellow_line_detected:
+                yl = np.array((wl[0] if yl is None else yl[0], wl[1] + 2 * off))
+            elif wl[1] is None:
+                wl[1] = yl[1]
+            elif yl[1] is None:
+                yl[1] = wl[1]
+        # wl = np.array(
+        #     (yl[0] if wl is None or wl[1] is None else wl[0], yl[1] - 2 * off)) if not white_line_detected else wl
+        # yl = np.array(
+        #     (wl[0] if yl is None or yl[1] is None else yl[0], wl[1] + 2 * off)) if not yellow_line_detected else yl
+        # assert yl is not None and wl is not None
         return (yl + wl) / 2.
 
     @staticmethod
     def handle_noise_straight(yl, y_segs, wl, w_segs, off):
         yellow_line_detected = True if yl is not None else False
         white_line_detected = True if wl is not None else False
+        right_white = False
+        grass_yellow = False
 
         if white_line_detected:
             # While going straight, if white line is detected on the left side and yellow line is not detected,
             # shift the yellow line two units, and white line 4 units away
             if w_segs[:, -2].mean() > 0:
-                yl = np.array((wl[0], wl[1] - 2 * off)) if not yellow_line_detected else yl
+                # print("white detected on left")
+                # yl = np.array((wl[0], wl[1] - 2 * off)) if not yellow_line_detected else yl
                 wl = None
+                right_white = True
 
             # If both lines are detected but yellow line is detected on the right side of white line, assume that
             # it is grass and compute trajectory using white line
             elif yellow_line_detected and y_segs[:, -2].mean() < w_segs[:, -2].mean():
                 yl = None
-        return yl, wl
+                grass_yellow = True
+        return yl, wl, grass_yellow, right_white
 
     @staticmethod
     def get_lookahead_point(tj_eq, l, y_f, n_y, w_f, n_w):
@@ -136,6 +154,13 @@ class LaneControllerNode(DTROS):
         if not r:
             r = r1 if norm(dir_pt - r1) < norm(dir_pt - r2) else r2
         return r
+
+    @staticmethod
+    def get_distance_from_line(point, line):
+        a, b, c = -line[0], 1, -line[1]
+        x, y = point
+        dist = (np.abs(a * x + b * y + c)) / (np.sqrt(a ** 2 + b ** 2))
+        return dist
 
     def load_params(self):
         def _init_dtparam(name):
@@ -156,14 +181,13 @@ class LaneControllerNode(DTROS):
     def cbSegmentsGround(self, line_segments_msg):
         self.segments_msg = line_segments_msg
         self.load_params()
-
         data = self.parse_segment_list(line_segments_msg, self.p["th_seg_dist"].value)  # was 0.3
         white_segments, yellow_segments = data[data[:, 0] == 0.], data[data[:, 0] == 1.]
         n_white_segs, n_yellow_segs = len(white_segments), len(yellow_segments)
         line_detection_threshold = self.p["th_seg_count"].value
         white_detected, yellow_detected = n_white_segs > line_detection_threshold, n_yellow_segs > line_detection_threshold
-
         # If none of the lines are detected, assume that the trajectory has not changed
+        gr_f, wr_f, wts_f = False, False, False
         if not white_detected and not yellow_detected:
             w_eq, y_eq, tj_eq, w_f, y_f = self.state
 
@@ -176,21 +200,31 @@ class LaneControllerNode(DTROS):
 
             tj_slope = ((w_eq[0] if w_eq is not None else y_eq[0]) + (y_eq[0] if y_eq is not None else w_eq[0])) / 2.
 
+            wts_f = False
             # Handle any noise
             if np.abs(tj_slope) <= self.p["th_lane_slope"].value:
-                y_eq, w_eq = self.handle_noise_straight(y_eq, yellow_segments, w_eq, white_segments,
+                y_eq, w_eq, gr_f, wr_f = self.handle_noise_straight(y_eq, yellow_segments, w_eq, white_segments,
                                                         self.p["off_lane"].value)
-
             # While turning right, only use the yellow line
-            elif tj_slope < 0 and np.abs(tj_slope) > self.p["th_lane_slope"].value and yellow_detected:
-                w_eq = None
+            elif tj_slope < 0 and np.abs(tj_slope) > self.p[
+                "th_lane_slope"].value and yellow_detected and w_eq is not None:
+                w_eq[1] = None
+                wts_f = True
 
             tj_eq = self.get_trajectory(y_eq, w_eq, self.p["off_lane"].value)
 
+        # y_eq =
         r = self.get_lookahead_point(tj_eq, self.p["L"].value, y_f, n_yellow_segs, w_f, n_white_segs)
-        self.state = (w_eq, y_eq, tj_eq, w_f, y_f)
+        self.state = w_eq, y_eq, tj_eq, w_f, y_f,
         self.tj = tj_eq
         self.r_y = r[1]
+        w_eq = np.array([0, 0]) if w_eq is None else w_eq
+        y_eq = np.array([0, 0]) if y_eq is None else y_eq
+        print(f"Y:{yellow_detected}{y_eq} W:{white_detected}{w_eq} Gr:{gr_f} Wr:{wr_f} Wts_f:{wts_f}")
+        # print(y_eq[0] if y_eq is not None else "None", w_eq[0] if w_eq is not None else "None")
+        # if w_eq is not None and y_eq is not None:
+        #     print(y_eq, tj_eq, w_eq)
+        #     print(self.get_distance_from_line(r, y_eq), self.get_distance_from_line(r, tj_eq), self.get_distance_from_line(r, w_eq))
 
     def cbLanePoses(self, input_pose_msg):
         """Callback receiving pose messages
@@ -206,15 +240,22 @@ class LaneControllerNode(DTROS):
 
         v = self.p["v"].value
         L = self.p["L"].value
-        slope = np.abs(self.tj[0]) + 1
+        slope = np.abs(self.tj[0])
         # L *= (1 / np.exp(self.p["exp"].value * slope))
         if slope >= self.p["th_turn_slope"].value:
-            L_factor = 1 / (slope * self.p["wt_slope"].value)
-            L *= L_factor
+            L = 0.35
+            v = 0.2
+            # L_factor = 1 / (slope * self.p["wt_slope"].value)
+            # L *= L_factor
         # L = min(L, self.p["max_L"].value)
         # print(L)
+        # print(self.r_y)
         omega = (2 * v * self.r_y) / L ** 2  # Pure Pursuit
-
+        # print(omega)
+        # omega = 0
+        # print(slope-1)
+        # print(omega)seglist_filtered
+        # print(omega)
         # Adjustments for turning
         # if np.abs(self.tj[0]) >= self.p[
         #     "th_turn_slope"].value:
@@ -228,6 +269,7 @@ class LaneControllerNode(DTROS):
         #     v *= np.abs(omega) * self.p["wt_omega"].value
 
         # v *= 1 / ((np.abs(omega) + 1) * self.p["wt_omega"].value)
+        # print(np.abs(omega) + 1, v)
         car_control_msg.v = v
         car_control_msg.omega = omega
         # self.log(car_control_msg.omega)
