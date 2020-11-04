@@ -198,20 +198,30 @@ class LaneControllerNode(DTROS):
             y_eq, y_f = LaneControllerNode.get_equation(yellow_segments, self.p["th_seg_close"].value,
                                                         self.p["th_seg_far"].value) if yellow_detected else (None, None)
 
-            tj_slope = ((w_eq[0] if w_eq is not None else y_eq[0]) + (y_eq[0] if y_eq is not None else w_eq[0])) / 2.
+            # If taking left turn and only yellow is detected
+            prev_m = self.state[2][0]
+            if y_eq is not None and w_eq is None and np.abs(prev_m) > self.p["th_turn_slope"].value and prev_m >= 0:
+                y_eq = None
+            elif w_eq is not None and y_eq is None and np.abs(prev_m) > self.p["th_turn_slope"].value and prev_m < 0:
+                w_eq = None
 
-            wts_f = False
-            # Handle any noise
-            if np.abs(tj_slope) <= self.p["th_lane_slope"].value:
-                y_eq, w_eq, gr_f, wr_f = self.handle_noise_straight(y_eq, yellow_segments, w_eq, white_segments,
-                                                        self.p["off_lane"].value)
-            # While turning right, only use the yellow line
-            elif tj_slope < 0 and np.abs(tj_slope) > self.p[
-                "th_lane_slope"].value and yellow_detected and w_eq is not None:
-                w_eq[1] = None
-                wts_f = True
+            if w_eq is None and y_eq is None:
+                w_eq, y_eq, tj_eq, w_f, y_f = self.state
+            else:
+                tj_slope = ((w_eq[0] if w_eq is not None else y_eq[0]) + (y_eq[0] if y_eq is not None else w_eq[0])) / 2.
 
-            tj_eq = self.get_trajectory(y_eq, w_eq, self.p["off_lane"].value)
+                wts_f = False
+                # Handle any noise
+                if np.abs(tj_slope) <= self.p["th_lane_slope"].value:
+                    y_eq, w_eq, gr_f, wr_f = self.handle_noise_straight(y_eq, yellow_segments, w_eq, white_segments,
+                                                            self.p["off_lane"].value)
+                # While turning right, only use the yellow line
+                elif tj_slope < 0 and np.abs(tj_slope) > self.p[
+                    "th_lane_slope"].value and yellow_detected and w_eq is not None:
+                    w_eq[1] = None
+                    wts_f = True
+
+                tj_eq = self.get_trajectory(y_eq, w_eq, self.p["off_lane"].value)
 
         # y_eq =
         r = self.get_lookahead_point(tj_eq, self.p["L"].value, y_f, n_yellow_segs, w_f, n_white_segs)
